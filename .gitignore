@@ -6,3 +6,4 @@
 
 # Python egg metadata
 /*.egg-info
+.vscode/*

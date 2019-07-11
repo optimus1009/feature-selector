@@ -1,44 +1,28 @@
-# numpy and pandas for data manipulation
 import pandas as pd
 import numpy as np
-
-# model used for feature importances
 import lightgbm as lgb
-
-# utility for early stopping with a validation set
 from sklearn.model_selection import train_test_split
-
-# visualizations
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# memory management
 import gc
-
-# utilities
 from itertools import chain
 
 class FeatureSelector():
     """
-    Class for performing feature selection for machine learning or data preprocessing.
+    特征选择（feature selection）类，实现了几种特征选择的方法
     
-    Implements five different methods to identify features for removal 
-    
-        1. Find columns with a missing percentage greater than a specified threshold
-        2. Find columns with a single unique value
-        3. Find collinear variables with a correlation greater than a specified correlation coefficient
-        4. Find features with 0.0 feature importance from a gradient boosting machine (gbm)
-        5. Find low importance features that do not contribute to a specified cumulative feature importance from the gbm
+    这个 FeatureSelector 包含一些最常用的特征选择方法：
+        1.具有高缺失值百分比的特征, 可以指定一个阈值
+        2.共线性（高度相关的）特征
+        3.在基于树的模型中重要度为零的特征(基于lightgbm)
+        4.重要度较低的特征
+        5.具有单个唯一值（unique value）的特征 
         
     Parameters
     --------
-        data : dataframe
-            A dataset with observations in the rows and features in the columns
+        data : pandas dataframe
 
-        labels : array or series, default = None
-            Array of labels for training the machine learning model to find feature importances. These can be either binary labels
-            (if task is 'classification') or continuous targets (if task is 'regression').
-            If no labels are provided, then the feature importance based methods are not available.
+        labels : 数组或者 pd.Series
         
     Attributes
     --------
@@ -46,21 +30,11 @@ class FeatureSelector():
     ops : dict
         Dictionary of operations run and features identified for removal
         
-    missing_stats : dataframe
-        The fraction of missing values for all features
-    
-    record_missing : dataframe
-        The fraction of missing values for features with missing fraction above threshold
-        
-    unique_stats : dataframe
-        Number of unique values for all features
-    
-    record_single_unique : dataframe
-        Records the features that have a single unique value
-        
-    corr_matrix : dataframe
-        All correlations between all features in the data
-    
+    missing_stats : dataframe 各个特征的缺失值比例情况，eg: 某个特征缺失比例多少
+    record_missing : dataframe 
+    unique_stats : dataframe 有 unique 值的特征 的比例情况 
+    record_single_unique : dataframe 
+    corr_matrix : dataframe 所有特征的共线性
     record_collinear : dataframe
         Records the pairs of collinear variables with a correlation coefficient above the threshold
         
@@ -72,14 +46,6 @@ class FeatureSelector():
     
     record_low_importance : dataframe
         Records the lowest importance features not needed to reach the threshold of cumulative importance according to the gbm
-    
-    
-    Notes
-    --------
-    
-        - All 5 operations can be run with the `identify_all` method.
-        - If using feature importances, one-hot encoding is used for categorical variables which creates new columns
-    
     """
     
     def __init__(self, data, labels=None):
@@ -112,104 +78,67 @@ class FeatureSelector():
         self.one_hot_correlated = False
         
     def identify_missing(self, missing_threshold):
-        """Find the features with a fraction of missing values above `missing_threshold`"""
-        
+        """找到缺失值超过阈值的特征(列)"""
         self.missing_threshold = missing_threshold
 
-        # Calculate the fraction of missing in each column 
+        # 统计每一列的缺失值
         missing_series = self.data.isnull().sum() / self.data.shape[0]
-        self.missing_stats = pd.DataFrame(missing_series).rename(columns = {'index': 'feature', 0: 'missing_fraction'})
-
-        # Sort with highest number of missing values on top
+        self.missing_stats = pd.DataFrame(missing_series).reset_index().rename(columns = {'index': 'feature', 0: 'missing_fraction'})
         self.missing_stats = self.missing_stats.sort_values('missing_fraction', ascending = False)
-
-        # Find the columns with a missing percentage above the threshold
-        record_missing = pd.DataFrame(missing_series[missing_series > missing_threshold]).reset_index().rename(columns = 
-                                                                                                               {'index': 'feature', 
-                                                                                                                0: 'missing_fraction'})
-
+        record_missing = pd.DataFrame(missing_series[missing_series > missing_threshold]).reset_index().rename(columns = {'index': 'feature', 0: 'missing_fraction'})
         to_drop = list(record_missing['feature'])
-
         self.record_missing = record_missing
-        self.ops['missing'] = to_drop
-        
+        self.ops['missing'] = to_drop # 空值比例超过阈值的特征列表
         print('%d features with greater than %0.2f missing values.\n' % (len(self.ops['missing']), self.missing_threshold))
-        
-    def identify_single_unique(self):
-        """Finds features with only a single unique value. NaNs do not count as a unique value. """
 
-        # Calculate the unique counts in each column
+    def identify_single_unique(self):
+        """找到只有一个值的特征, 空值不算 """
+
         unique_counts = self.data.nunique()
         self.unique_stats = pd.DataFrame(unique_counts).rename(columns = {'index': 'feature', 0: 'nunique'})
         self.unique_stats = self.unique_stats.sort_values('nunique', ascending = True)
-        
-        # Find the columns with only one unique count
-        record_single_unique = pd.DataFrame(unique_counts[unique_counts == 1]).reset_index().rename(columns = {'index': 'feature', 
-                                                                                                                0: 'nunique'})
-
+        record_single_unique = pd.DataFrame(unique_counts[unique_counts == 1]).reset_index().rename(columns = {'index': 'feature', 0: 'nunique'})
         to_drop = list(record_single_unique['feature'])
-    
         self.record_single_unique = record_single_unique
         self.ops['single_unique'] = to_drop
-        
         print('%d features with a single unique value.\n' % len(self.ops['single_unique']))
-    
+
     def identify_collinear(self, correlation_threshold, one_hot=False):
         """
-        Finds collinear features based on the correlation coefficient between features. 
-        For each pair of features with a correlation coefficient greather than `correlation_threshold`,
-        only one of the pair is identified for removal. 
-
-        Using code adapted from: https://chrisalbon.com/machine_learning/feature_selection/drop_highly_correlated_features/
-        
-        Parameters
-        --------
-
-        correlation_threshold : float between 0 and 1
-            Value of the Pearson correlation cofficient for identifying correlation features
-
+        计算各个特征直接的相关性系数
+        ref: https://chrisalbon.com/machine_learning/feature_selection/drop_highly_correlated_features/
         one_hot : boolean, default = False
-            Whether to one-hot encode the features before calculating the correlation coefficients
-
+            在计算互相关时是否先进行one-hot
         """
-        
         self.correlation_threshold = correlation_threshold
         self.one_hot_correlated = one_hot
         
-         # Calculate the correlations between every column
+         # 计算两两特征的相关性系数
         if one_hot:
-            
-            # One hot encoding
             features = pd.get_dummies(self.data)
             self.one_hot_features = [column for column in features.columns if column not in self.base_features]
-
-            # Add one hot encoded data to original data
             self.data_all = pd.concat([features[self.one_hot_features], self.data], axis = 1)
-            
             corr_matrix = pd.get_dummies(features).corr()
-
         else:
             corr_matrix = self.data.corr()
         
         self.corr_matrix = corr_matrix
     
-        # Extract the upper triangle of the correlation matrix
+        # 获取相关性矩阵的上三角部分, 也可以使用下三角
+        # 这里使用 dataFrame.where(cond, other_val) 函数，当条件cond为false时用other_val代替
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k = 1).astype(np.bool))
         
-        # Select the features with correlations above the threshold
-        # Need to use the absolute value
+        # 选择相关性系数大于阈值的特征,某一特征只要与另外任意一个特征的相关性大于阈值，那么就将该特征标记
+        # 这里用any函数方便判断,any() 函数用于判断给定的可迭代参数 iterable 是否全部为 False，若是则返回 False，如果有一个为 True，则返回 True (有any ture 则返回 true)
         to_drop = [column for column in upper.columns if any(upper[column].abs() > correlation_threshold)]
-
-        # Dataframe to hold correlated pairs
         record_collinear = pd.DataFrame(columns = ['drop_feature', 'corr_feature', 'corr_value'])
 
-        # Iterate through the columns to drop to record pairs of correlated features
         for column in to_drop:
 
-            # Find the correlated features
+            # 找到与column相关性系数大于阈值的特征
             corr_features = list(upper.index[upper[column].abs() > correlation_threshold])
 
-            # Find the correlated values
+            # 找到相关性系数
             corr_values = list(upper[column][upper[column].abs() > correlation_threshold])
             drop_features = [column for _ in range(len(corr_features))]    
 
@@ -219,17 +148,15 @@ class FeatureSelector():
                                              'corr_value': corr_values})
 
             # Add to dataframe
-            record_collinear = record_collinear.append(temp_df, ignore_index = True)
+            record_collinear = record_collinear.append(temp_df, ignore_index = True) # ignore_index: If True, do not use the index labels.
 
         self.record_collinear = record_collinear
         self.ops['collinear'] = to_drop
         
-        print('%d features with a correlation magnitude greater than %0.2f.\n' % (len(self.ops['collinear']), self.correlation_threshold))
+        print('%d features with a correlation greater than %0.2f.\n' % (len(self.ops['collinear']), self.correlation_threshold))
 
-    def identify_zero_importance(self, task, eval_metric=None, 
-                                 n_iterations=10, early_stopping = True):
+    def identify_zero_importance(self, task, eval_metric=None, n_iterations=10, early_stopping = True):
         """
-        
         Identify the features with zero importance according to a gradient boosting machine.
         The gbm can be trained with early stopping using a validation set to prevent overfitting. 
         The feature importances are averaged over `n_iterations` to reduce variance. 
@@ -238,21 +165,15 @@ class FeatureSelector():
 
         Parameters 
         --------
-
         eval_metric : string
             Evaluation metric to use for the gradient boosting machine for early stopping. Must be
             provided if `early_stopping` is True
-
         task : string
             The machine learning task, either 'classification' or 'regression'
-
         n_iterations : int, default = 10
             Number of iterations to train the gradient boosting machine
-            
         early_stopping : boolean, default = True
             Whether or not to use early stopping with a validation set when training
-        
-        
         Notes
         --------
         
@@ -263,23 +184,17 @@ class FeatureSelector():
         """
 
         if early_stopping and eval_metric is None:
-            raise ValueError("""eval metric must be provided with early stopping. Examples include "auc" for classification or
-                             "l2" for regression.""")
+            raise ValueError("""eval metric must be provided with early stopping. Examples include "auc" for classification or "l2" for regression.""")
             
         if self.labels is None:
             raise ValueError("No training labels provided.")
-        
-        # One hot encoding
         features = pd.get_dummies(self.data)
         self.one_hot_features = [column for column in features.columns if column not in self.base_features]
-
-        # Add one hot encoded data to original data
         self.data_all = pd.concat([features[self.one_hot_features], self.data], axis = 1)
 
-        # Extract feature names
         feature_names = list(features.columns)
 
-        # Convert to np array
+        
         features = np.array(features)
         labels = np.array(self.labels).reshape((-1, ))
 
@@ -318,9 +233,9 @@ class FeatureSelector():
             else:
                 model.fit(features, labels)
 
-            # Record the feature importances
+            # 这里需要注意 feature_importance_values 是ndarray类型才可以向量相加。如果是普通python list 则相当于concat
             feature_importance_values += model.feature_importances_ / n_iterations
-
+        # 这里需要注意 model.feature_importances 的特征顺序是否跟 df.columns的特征顺序一致
         feature_importances = pd.DataFrame({'feature': feature_names, 'importance': feature_importance_values})
 
         # Sort features according to importance
@@ -373,11 +288,9 @@ class FeatureSelector():
         self.record_low_importance = record_low_importance
         self.ops['low_importance'] = to_drop
     
-        print('%d features required for cumulative importance of %0.2f after one hot encoding.' % (len(self.feature_importances) -
-                                                                            len(self.record_low_importance), self.cumulative_importance))
-        print('%d features do not contribute to cumulative importance of %0.2f.\n' % (len(self.ops['low_importance']),
-                                                                                               self.cumulative_importance))
-        
+        print('%d features required for cumulative importance of %0.2f after one hot encoding.' % (len(self.feature_importances) - len(self.record_low_importance), self.cumulative_importance))
+        print('%d features do not contribute to cumulative importance of %0.2f.\n' % (len(self.ops['low_importance']),self.cumulative_importance))
+
     def identify_all(self, selection_params):
         """
         Use all five of the methods to identify features to remove.
